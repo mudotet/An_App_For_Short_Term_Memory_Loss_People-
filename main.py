@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Iterable, Optional, Union
 
@@ -33,20 +34,19 @@ class AppConfig:
     camera_width: int = 640
     camera_height: int = 480
     camera_fps: int = 24
-    face_distance_threshold: float = 0.5
-    face_absence_timeout_seconds: float = 8.0
+    face_distance_threshold: float = 0.62
+    face_absence_timeout_seconds: float = 3.0
     face_frame_scale: float = 0.5
     face_model: str = "hog"
     face_upsample: int = 1
     process_every_n_frames: int = 3
     face_process_interval_seconds: float = 0.25
     async_face_detection: bool = True
-    unicode_overlay: bool = True
-    show_fps: bool = True
     whisper_model: str = "small"
     whisper_language: str = "vi"
     audio_sample_rate: int = 16000
-    audio_chunk_seconds: int = 5
+    audio_chunk_seconds: int = 2
+    stt_min_confidence: float = 0.8
     audio_enabled: bool = True
     tts_enabled: bool = True
     tts_cooldown_seconds: int = 90
@@ -59,8 +59,8 @@ class AppConfig:
             camera_width=int(os.getenv("CAMERA_WIDTH", "640")),
             camera_height=int(os.getenv("CAMERA_HEIGHT", "480")),
             camera_fps=int(os.getenv("CAMERA_FPS", "24")),
-            face_distance_threshold=float(os.getenv("FACE_DISTANCE_THRESHOLD", "0.5")),
-            face_absence_timeout_seconds=float(os.getenv("FACE_ABSENCE_TIMEOUT_SECONDS", "8")),
+            face_distance_threshold=float(os.getenv("FACE_DISTANCE_THRESHOLD", "0.62")),
+            face_absence_timeout_seconds=float(os.getenv("FACE_ABSENCE_TIMEOUT_SECONDS", "3")),
             face_frame_scale=float(os.getenv("FACE_FRAME_SCALE", "0.5")),
             face_model=os.getenv("FACE_MODEL", "hog"),
             face_upsample=max(0, int(os.getenv("FACE_UPSAMPLE", "1"))),
@@ -70,12 +70,11 @@ class AppConfig:
                 float(os.getenv("FACE_PROCESS_INTERVAL_SECONDS", "0.25")),
             ),
             async_face_detection=_env_bool("ASYNC_FACE_DETECTION", True),
-            unicode_overlay=_env_bool("UNICODE_OVERLAY", True),
-            show_fps=_env_bool("SHOW_FPS", True),
             whisper_model=os.getenv("WHISPER_MODEL", "small"),
             whisper_language=os.getenv("WHISPER_LANGUAGE", "vi"),
             audio_sample_rate=int(os.getenv("AUDIO_SAMPLE_RATE", "16000")),
-            audio_chunk_seconds=max(1, int(os.getenv("AUDIO_CHUNK_SECONDS", "5"))),
+            audio_chunk_seconds=max(1, int(os.getenv("AUDIO_CHUNK_SECONDS", "2"))),
+            stt_min_confidence=float(os.getenv("STT_MIN_CONFIDENCE", "0.8")),
             audio_enabled=_env_bool("AUDIO_ENABLED", True),
             tts_enabled=_env_bool("TTS_ENABLED", True),
             tts_cooldown_seconds=int(os.getenv("TTS_COOLDOWN_SECONDS", "90")),
@@ -88,6 +87,8 @@ class ConversationSession:
     user_id: int
     name: str
     latest_summary: str = ""
+    live_text: str = ""
+    is_first_meeting: bool = False
     started_at: float = field(default_factory=time.monotonic)
     last_seen: float = field(default_factory=time.monotonic)
     transcript_parts: list[str] = field(default_factory=list)
@@ -101,6 +102,7 @@ class ConversationSession:
             text = chunk
         text = " ".join(text.strip().split())
         if text:
+            self.live_text = text
             self.transcript_parts.append(f"[{timestamp}] {text}")
 
     def transcript(self) -> str:
@@ -121,6 +123,7 @@ class MemoryAssistantApp:
             language=config.whisper_language,
             sample_rate=config.audio_sample_rate,
             chunk_seconds=config.audio_chunk_seconds,
+            min_confidence=config.stt_min_confidence,
             enabled=config.audio_enabled,
         )
         self.speaker = ReminderSpeaker(
@@ -136,21 +139,18 @@ class MemoryAssistantApp:
         self.face_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-worker")
         self.pending_face_future: Optional[Future[list[FaceLabel]]] = None
         self.state_lock = threading.RLock()
-        self.display_fps = 0.0
-        self._fps_window_started_at = time.monotonic()
-        self._fps_window_frames = 0
 
     def run(self) -> int:
         self._print_startup_notes()
+        camera = self._open_camera()
+        if camera is None:
+            print("Không mở được webcam nào. Hãy kiểm tra quyền Camera trong System Settings > Privacy & Security.")
+            return 1
+
+        # OpenCV and faster-whisper both bundle video libraries on macOS.
+        # Opening the camera first avoids AVFoundation initialization conflicts.
         self.audio.start()
         self.speaker.start()
-
-        camera = cv2.VideoCapture(self.config.webcam_index)
-        if not camera.isOpened():
-            print(f"Không mở được webcam index {self.config.webcam_index}.")
-            self._shutdown_workers()
-            return 1
-        self._configure_camera(camera)
 
         try:
             while True:
@@ -167,8 +167,7 @@ class MemoryAssistantApp:
                 self._finalize_absent_sessions()
                 self._print_worker_errors()
 
-                draw_labels(frame, self.latest_labels, unicode_text=self.config.unicode_overlay)
-                self._draw_fps(frame)
+                draw_labels(frame, self.latest_labels)
                 cv2.imshow("Memory Assistant Demo", frame)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -180,7 +179,6 @@ class MemoryAssistantApp:
                     self._add_manual_note()
 
                 self.frame_number += 1
-                self._update_fps()
         finally:
             camera.release()
             cv2.destroyAllWindows()
@@ -190,6 +188,26 @@ class MemoryAssistantApp:
             self.db.close()
 
         return 0
+
+    def _open_camera(self):
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
+        indices = [self.config.webcam_index, *(
+            index for index in range(3) if index != self.config.webcam_index
+        )]
+
+        for index in indices:
+            camera = cv2.VideoCapture(index, backend)
+            if camera.isOpened():
+                self._configure_camera(camera)
+                for _ in range(20):
+                    ok, frame = camera.read()
+                    if ok and frame is not None and frame.size:
+                        self.config.webcam_index = index
+                        print(f"Đang dùng webcam index {index}.")
+                        return camera
+                    time.sleep(0.08)
+            camera.release()
+        return None
 
     def _maybe_process_faces(self, frame, now: float) -> None:
         should_process = (
@@ -222,29 +240,6 @@ class MemoryAssistantApp:
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.camera_height)
         camera.set(cv2.CAP_PROP_FPS, self.config.camera_fps)
         camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    def _update_fps(self) -> None:
-        self._fps_window_frames += 1
-        now = time.monotonic()
-        elapsed = now - self._fps_window_started_at
-        if elapsed >= 1:
-            self.display_fps = self._fps_window_frames / elapsed
-            self._fps_window_frames = 0
-            self._fps_window_started_at = now
-
-    def _draw_fps(self, frame) -> None:
-        if not self.config.show_fps:
-            return
-        cv2.putText(
-            frame,
-            f"FPS {self.display_fps:4.1f}",
-            (24, frame.shape[0] - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (40, 255, 180),
-            2,
-            cv2.LINE_AA,
-        )
 
     def _recognize_frame(self, frame) -> list[FaceLabel]:
         try:
@@ -287,32 +282,41 @@ class MemoryAssistantApp:
 
         if match:
             latest = self.db.get_latest_conversation(match.id)
-            latest_summary = latest["summary"] if latest else "Đã gặp trước đó, chưa có tóm tắt hội thoại."
+            latest_summary = latest["summary"] if latest else ""
+            latest_time = _time_ago(latest["created_at"]) if latest else ""
+            latest_context = f"{latest_time} · {latest_summary}" if latest else ""
             is_new_session = match.id not in self.sessions
             session = self.sessions.get(match.id)
             if not session:
                 session = ConversationSession(
                     user_id=match.id,
                     name=match.name,
-                    latest_summary=latest_summary,
+                    latest_summary=latest_context,
+                    is_first_meeting=not bool(latest),
                     last_seen=now,
                 )
                 self.sessions[match.id] = session
             session.name = match.name
-            session.latest_summary = latest_summary
+            session.latest_summary = latest_context
             session.last_seen = now
 
             if is_new_session and latest:
+                display_name = _display_name(match.name)
                 self.speaker.speak_once(
                     key=f"user-{match.id}",
-                    message=f"Đây là {match.name}. Lần trước: {latest_summary}",
+                    message=(
+                        f"Đây là {display_name}. Bạn đã nói chuyện {latest_time}: {latest_summary}"
+                        if display_name
+                        else f"Bạn đã gặp người này {latest_time}: {latest_summary}"
+                    ),
                 )
 
             return FaceLabel(
                 location=detection.location,
-                title=match.name,
-                subtitle=latest_summary,
+                title=_display_name(session.name),
+                subtitle=session.live_text or ("" if session.is_first_meeting else session.latest_summary),
                 distance=match.distance,
+                is_new=session.is_first_meeting,
                 user_id=match.id,
             )
 
@@ -320,23 +324,18 @@ class MemoryAssistantApp:
         self.sessions[user_id] = ConversationSession(
             user_id=user_id,
             name=name,
-            latest_summary="Người mới - đang ghi nhớ cuộc trò chuyện này.",
+            is_first_meeting=True,
             last_seen=now,
         )
         return FaceLabel(
             location=detection.location,
-            title=name,
-            subtitle="Người mới - đang ghi nhớ cuộc trò chuyện này.",
+            title=_display_name(name),
             is_new=True,
             user_id=user_id,
         )
 
     def _register_new_person(self, embedding: list[float]) -> tuple[int, str]:
         default_name = f"Nguoi moi {datetime.now().strftime('%H%M%S')}"
-        self.speaker.speak_once(
-            key=f"new-person-{time.monotonic()}",
-            message="Tôi đang gặp một người mới. Vui lòng nhập tên trên máy tính.",
-        )
         print("\nPhát hiện người mới.")
         if self.config.auto_name_new_people or not sys.stdin.isatty():
             typed_name = ""
@@ -362,14 +361,37 @@ class MemoryAssistantApp:
 
         with self.state_lock:
             targets = [self.sessions[user_id] for user_id in self.visible_user_ids if user_id in self.sessions]
+            if not targets:
+                now = time.monotonic()
+                targets = [
+                    session
+                    for session in self.sessions.values()
+                    if now - session.last_seen <= self.config.face_absence_timeout_seconds
+                ]
         if not targets:
             print("Có transcript mới nhưng không có khuôn mặt nào trong khung hình, nên chưa gán vào hồ sơ.")
             return
 
         target_names = ", ".join(session.name for session in targets)
         for chunk in chunks:
+            spoken_name = _extract_spoken_name(chunk.text)
             for session in targets:
                 session.add_transcript(chunk)
+                if spoken_name and not _display_name(session.name):
+                    session.name = spoken_name
+                    self.db.update_user_name(session.user_id, spoken_name)
+            sessions_by_id = {session.user_id: session for session in targets}
+            with self.state_lock:
+                self.latest_labels = [
+                    replace(
+                        label,
+                        title=_display_name(sessions_by_id[label.user_id].name),
+                        subtitle=sessions_by_id[label.user_id].live_text,
+                    )
+                    if label.user_id in sessions_by_id
+                    else label
+                    for label in self.latest_labels
+                ]
             print(f"STT -> {target_names}: {chunk.text}")
 
     def _finalize_absent_sessions(self) -> None:
@@ -401,12 +423,21 @@ class MemoryAssistantApp:
             transcript = session.transcript()
             try:
                 if transcript:
-                    summary = self.summarizer.summarize(transcript, person_name=session.name)
-                    conversation_id = self.db.add_conversation(session.user_id, transcript, summary)
-                    print(
-                        f"Đã lưu hội thoại #{conversation_id} cho {session.name} "
-                        f"({reason}): {summary}"
+                    summary = self.summarizer.summarize(
+                        transcript,
+                        person_name=_display_name(session.name) or None,
                     )
+                    conversation_id = self.db.add_conversation(session.user_id, transcript, summary)
+                    if summary:
+                        print(
+                            f"Đã lưu hội thoại #{conversation_id} cho {session.name} "
+                            f"({reason}): {summary}"
+                        )
+                    else:
+                        print(
+                            f"Đã lưu transcript #{conversation_id} cho {session.name} "
+                            f"nhưng không hiển thị vì nội dung chưa đủ rõ."
+                        )
                 else:
                     print(f"Kết thúc phiên của {session.name} ({reason}) nhưng chưa có transcript.")
                 self.db.update_last_seen(session.user_id)
@@ -448,6 +479,62 @@ class MemoryAssistantApp:
     def _shutdown_workers(self) -> None:
         self.audio.stop()
         self.speaker.stop()
+
+
+_NAME_PATTERNS = (
+    re.compile(
+        r"\b(?:tôi|mình|em|anh|chị|cháu)\s+tên\s+là\s+([^,.;!?]{2,48})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\btên\s+(?:của\s+)?(?:tôi|mình|em|anh|chị|cháu)\s+là\s+([^,.;!?]{2,48})",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bgọi\s+(?:tôi|mình|em|anh|chị|cháu)\s+là\s+([^,.;!?]{2,48})", re.IGNORECASE),
+    re.compile(r"\b(?:tôi|mình)\s+là\s+([^,.;!?]{2,48})", re.IGNORECASE),
+)
+_NAME_END = re.compile(
+    r"\b(?:và|đến từ|ở|đang|làm|hôm nay|năm nay|rất vui|xin chào)\b",
+    re.IGNORECASE,
+)
+_NON_NAME_PREFIXES = ("bác sĩ", "giáo viên", "sinh viên", "một ", "người ")
+
+
+def _extract_spoken_name(text: str) -> str:
+    for pattern in _NAME_PATTERNS:
+        match = pattern.search(" ".join(text.split()))
+        if not match:
+            continue
+        candidate = _NAME_END.split(match.group(1), maxsplit=1)[0].strip(" :-")
+        candidate = " ".join(candidate.split()[:4])
+        if (
+            candidate
+            and not candidate.casefold().startswith(_NON_NAME_PREFIXES)
+            and all(word.replace("-", "").isalpha() for word in candidate.split())
+        ):
+            return candidate.title()
+    return ""
+
+
+def _display_name(name: str) -> str:
+    normalized = name.strip()
+    lowered = normalized.casefold()
+    if lowered == "unknown" or lowered.startswith(("nguoi moi ", "người mới ")):
+        return ""
+    return normalized
+
+
+def _time_ago(when: datetime, now: Optional[datetime] = None) -> str:
+    seconds = max(0, int(((now or datetime.now(when.tzinfo)) - when).total_seconds()))
+    if seconds < 60:
+        return "vừa xong"
+    if seconds < 3600:
+        return f"{seconds // 60} phút trước"
+    if seconds < 86400:
+        return f"{seconds // 3600} giờ trước"
+    if seconds < 604800:
+        return f"{seconds // 86400} ngày trước"
+    return f"{seconds // 604800} tuần trước"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -494,7 +581,6 @@ def main() -> int:
         config.face_upsample = max(config.face_upsample, 1)
         config.process_every_n_frames = max(config.process_every_n_frames, 4)
         config.face_process_interval_seconds = max(config.face_process_interval_seconds, 0.25)
-        config.unicode_overlay = False
     if args.accurate_detect:
         config.face_frame_scale = max(config.face_frame_scale, 0.7)
         config.face_upsample = max(config.face_upsample, 2)

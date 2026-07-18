@@ -23,13 +23,15 @@ class AudioTranscriber:
         model_size: str = "small",
         language: str = "vi",
         sample_rate: int = 16000,
-        chunk_seconds: int = 5,
+        chunk_seconds: int = 2,
+        min_confidence: float = 0.8,
         enabled: bool = True,
     ) -> None:
         self.model_size = model_size
         self.language = language
         self.sample_rate = sample_rate
         self.chunk_seconds = chunk_seconds
+        self.min_confidence = min_confidence
         self.enabled = enabled
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -113,15 +115,36 @@ class AudioTranscriber:
                 temp_path,
                 language=self.language,
                 vad_filter=True,
+                vad_parameters={"threshold": 0.6, "min_speech_duration_ms": 300},
                 beam_size=1,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                word_timestamps=True,
+                hallucination_silence_threshold=0.5,
+                log_prob_threshold=-0.6,
+                no_speech_threshold=0.35,
             )
-            return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+            return " ".join(
+                segment.text.strip()
+                for segment in segments
+                if self._is_clear_segment(segment)
+            )
         finally:
             if temp_path:
                 try:
                     os.unlink(temp_path)
                 except OSError:
                     pass
+
+    def _is_clear_segment(self, segment: object) -> bool:
+        words = [word for word in (getattr(segment, "words", None) or []) if word.word.strip()]
+        return bool(
+            getattr(segment, "text", "").strip()
+            and len(words) >= 2
+            and getattr(segment, "avg_logprob", -99.0) >= -0.6
+            and getattr(segment, "no_speech_prob", 1.0) <= 0.35
+            and sum(word.probability for word in words) / len(words) >= self.min_confidence
+        )
 
 
 class ReminderSpeaker:
@@ -176,6 +199,17 @@ class ReminderSpeaker:
 
             engine = pyttsx3.init()
             engine.setProperty("rate", self.rate)
+            vietnamese_voice = next(
+                (
+                    voice
+                    for voice in engine.getProperty("voices")
+                    if "vi_" in str(getattr(voice, "languages", "")).lower()
+                    or getattr(voice, "name", "").lower() == "linh"
+                ),
+                None,
+            )
+            if vietnamese_voice:
+                engine.setProperty("voice", vietnamese_voice.id)
         except Exception as exc:
             self._errors.put(f"TTS is disabled: {exc}")
             return

@@ -29,7 +29,7 @@ class ConversationSummarizer:
     def summarize(self, transcript: str, person_name: Optional[str] = None) -> str:
         transcript = transcript.strip()
         if not transcript:
-            return "Không có nội dung hội thoại đủ rõ để tóm tắt."
+            return ""
 
         if not self.client:
             return self._fallback_summary(
@@ -41,7 +41,8 @@ class ConversationSummarizer:
             "Bạn là trợ lý trí nhớ cho người có vấn đề về trí nhớ ngắn hạn. "
             "Hãy tóm tắt hội thoại thành 1-2 câu tiếng Việt, tập trung vào tên người "
             "nếu có, chủ đề chính, quyết định, lời hứa, thời gian, địa điểm hoặc thông tin cần nhớ. "
-            "Không bịa thông tin nếu transcript không nói rõ."
+            "Chỉ dùng thông tin được nói rõ trong transcript, tuyệt đối không suy diễn hay đoán. "
+            "Nếu transcript rời rạc, vô nghĩa hoặc không có thông tin chắc chắn, chỉ trả về KHONG_DU_RO."
         )
         user_prompt = (
             f"Tên người đang nói chuyện trong hệ thống: {person_name or 'chưa rõ'}\n\n"
@@ -56,12 +57,13 @@ class ConversationSummarizer:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
+                temperature=0,
                 max_tokens=160,
             )
             summary = response.choices[0].message.content
             if summary:
-                return " ".join(summary.strip().split())
+                summary = " ".join(summary.strip().split())
+                return "" if "KHONG_DU_RO" in summary.upper() else summary
         except Exception as exc:
             return self._fallback_summary(transcript, f"Không gọi được GPT: {exc}")
 
@@ -69,6 +71,5 @@ class ConversationSummarizer:
 
     @staticmethod
     def _fallback_summary(transcript: str, reason: str) -> str:
-        excerpt = " ".join(transcript.split())[:240]
-        suffix = "..." if len(transcript) > 240 else ""
-        return f"{reason} Ghi chú tạm: {excerpt}{suffix}"
+        print(f"GPT fallback: {reason}")
+        return ""

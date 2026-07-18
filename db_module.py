@@ -86,9 +86,9 @@ class MemoryDatabase:
         vector = self._embedding_vector(embedding)
         row = self._conn().execute(
             """
-            SELECT id, name, first_seen, last_seen, face_embedding <=> %s AS distance
+            SELECT id, name, first_seen, last_seen, face_embedding <-> %s AS distance
             FROM users
-            ORDER BY face_embedding <=> %s
+            ORDER BY face_embedding <-> %s
             LIMIT 1
             """,
             (vector, vector),
@@ -125,6 +125,12 @@ class MemoryDatabase:
             (user_id,),
         )
 
+    def update_user_name(self, user_id: int, name: str) -> None:
+        self._conn().execute(
+            "UPDATE users SET name = %s WHERE id = %s",
+            (name.strip(), user_id),
+        )
+
     def add_conversation(self, user_id: int, transcript: str, summary: str) -> int:
         row = self._conn().execute(
             """
@@ -144,6 +150,7 @@ class MemoryDatabase:
             SELECT id, transcript, summary, created_at
             FROM conversations
             WHERE user_id = %s
+              AND BTRIM(summary) <> ''
             ORDER BY created_at DESC
             LIMIT 1
             """,
